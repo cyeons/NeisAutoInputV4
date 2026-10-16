@@ -1,0 +1,18 @@
+{
+  "student_count": 12,
+  "geometry": "1600x900+0+0",
+  "always_on_top": false,
+  "macro_delay": 0.2,
+  "start_hotkey": "F2",
+  "hotkey_start_enabled": true,
+  "tab_count": 2,
+  "leading_space": false,
+  "pyautogui_failsafe": true,
+  "ai_provider": "Gemini",
+  "gemini_model": "gemini-3.5-flash",
+  "openai_model": "gpt-5.4-mini",
+  "behavior_provider": "Gemini",
+  "behavior_gemini_model": "gemini-3.1-flash-lite",
+  "behavior_openai_model": "gpt-5.4-mini",
+  "behavior_sentence_count": 3
+}

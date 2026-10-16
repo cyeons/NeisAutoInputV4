@@ -1,0 +1,25 @@
+# 개인 작업 파일 (실제 학생 정보·개인 설정 — 절대 커밋하지 마세요)
+/config.json
+/data.csv
+/student.csv
+hb_work.json
+hb_custom_traits.json
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 빌드·임시 산출물
+build/
+dist/
+output/
+tmp/
+tmp_ui_plan/
+
+# 편집기·OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
