@@ -174,7 +174,7 @@ AI에게 "테스트를 실행해 줘"라고 하거나, 직접 실행합니다.
 .\.venv\Scripts\python.exe -m PyInstaller NeisAutoInputV4.spec
 ```
 
-`dist\NeisAutoInputV4.2.exe`가 만들어집니다. 이 파일 하나만 다른 컴퓨터에 복사해 실행하면 됩니다.
+`dist\NeisAutoInputV4.3.exe`가 만들어집니다. 이 파일 하나만 다른 컴퓨터에 복사해 실행하면 됩니다.
 
 ### 6. 바이브코딩할 때 주의할 점
 

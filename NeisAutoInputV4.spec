@@ -86,7 +86,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="NeisAutoInputV4.2",
+    name="NeisAutoInputV4.3",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

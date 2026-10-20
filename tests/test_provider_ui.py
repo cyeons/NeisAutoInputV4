@@ -75,7 +75,7 @@ class FakeKeyring:
 
 class ModelCatalogTests(unittest.TestCase):
     def test_only_supported_small_models_are_exposed(self) -> None:
-        self.assertEqual(model_ids("OpenAI"), ("gpt-5.4-mini", "gpt-5.4-nano"))
+        self.assertEqual(model_ids("OpenAI"), ("gpt-6-luna", "gpt-5.4-mini", "gpt-5.4-nano"))
         self.assertEqual(
             model_ids("Gemini"),
             ("gemini-3.5-flash", "gemini-3.1-flash-lite"),
@@ -154,7 +154,7 @@ class ProviderUiTests(unittest.TestCase):
         self.assertFalse(tab.model.isEditable())
         self.assertEqual(
             [tab.model.itemData(index) for index in range(tab.model.count())],
-            ["gpt-5.4-mini", "gpt-5.4-nano"],
+            ["gpt-6-luna", "gpt-5.4-mini", "gpt-5.4-nano"],
         )
         tab.close()
 

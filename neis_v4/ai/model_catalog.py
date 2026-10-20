@@ -36,6 +36,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         provider_id="OpenAI",
         label="OpenAI",
         models=(
+            ModelSpec("gpt-6-luna", "GPT 6 Luna", "최신·저비용"),
             ModelSpec("gpt-5.4-mini", "GPT-5.4 mini", "균형형"),
             ModelSpec("gpt-5.4-nano", "GPT-5.4 nano", "빠름·저비용"),
         ),
