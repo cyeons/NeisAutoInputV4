@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Property, QEasingCurve, QPointF, QPropertyAnimation, QSize, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QIntValidator, QPainter, QPen
+from PySide6.QtGui import QColor, QIcon, QIntValidator, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QButtonGroup,
@@ -17,6 +17,11 @@ from PySide6.QtWidgets import (
     QToolButton,
     QWidget,
 )
+
+
+def estimated_progress(elapsed: float, expected: float) -> int:
+    """AI는 진행 상황을 알려 주지 않아서 경과 시간 / 예상 시간으로 어림합니다. 끝나기 전에는 95%에서 멈춥니다."""
+    return min(95, int(elapsed / max(expected, 1) * 100))
 
 
 def set_faded_text(label: QLabel, text: str) -> None:
@@ -175,6 +180,64 @@ class ChoiceSegmentedControl(QFrame):
 
     def button(self, value: str) -> QPushButton | None:
         return self._buttons.get(value)
+
+
+class NeisInputControls(QWidget):
+    """AI 평어·행동발달 화면에서 바로 NEIS에 입력하는 '이동 칸' 선택과 시작·중지 버튼입니다."""
+
+    start_requested = Signal()
+    stop_requested = Signal()
+    tab_count_changed = Signal(int)
+
+    def __init__(self, tab_count: int, parent=None) -> None:
+        super().__init__(parent)
+        self.state = "idle"
+        self.tab_count = SegmentedControl([("2", 2), ("3", 3), ("4", 4)])
+        self.tab_count.setValue(tab_count)
+        self.tab_count.setToolTip("내용을 붙여 넣은 뒤 Tab 키로 이동할 칸 수입니다.")
+        self.tab_count.setAccessibleName("이동 칸")
+        self.button = QPushButton()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("이동 칸"))
+        layout.addWidget(HelpButton("이동 칸", "Tab 2번: 창체/행발\nTab 3번: 교과평어"))
+        layout.addWidget(self.tab_count)
+        layout.addWidget(self.button)
+        self.tab_count.valueChanged.connect(self.tab_count_changed.emit)
+        self.button.clicked.connect(self._on_clicked)
+        # 좁은 창에서도 버튼 글자가 잘리지 않게 가장 긴 글자에 맞춥니다.
+        widths = []
+        for state in ("armed", "running", "idle"):
+            self.set_state(state)
+            widths.append(self.button.sizeHint().width())
+        self.button.setMinimumWidth(max(widths))
+
+    def value(self) -> int:
+        return self.tab_count.value()
+
+    def _on_clicked(self) -> None:
+        (self.start_requested if self.state == "idle" else self.stop_requested).emit()
+
+    def set_state(self, state: str) -> None:
+        """자동 입력 화면의 시작 버튼과 같은 글자·색으로 바꿉니다."""
+        from neis_v4.ui.theme import COLORS, icon
+
+        self.state = state
+        text, variant, icon_name, color = {
+            "idle": ("NEIS 자동 입력", "secondary", "play", COLORS["muted"]),
+            "armed": ("시작 대기 취소", "secondary", "", COLORS["muted"]),
+            "running": ("입력 중지", "destructive", "square", COLORS["danger"]),
+        }[state]
+        self.button.setText(text)
+        self.button.setProperty("variant", variant)
+        self.button.setIcon(icon(icon_name, color) if icon_name else QIcon())
+        self.button.setToolTip(
+            "결과를 NEIS 표에 넣고 바로 NEIS에 자동 입력합니다." if state == "idle" else "Esc 키로도 멈출 수 있습니다."
+        )
+        self.button.style().unpolish(self.button)
+        self.button.style().polish(self.button)
+        self.tab_count.setEnabled(state == "idle")
 
 
 class ArrowComboBox(QComboBox):

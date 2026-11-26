@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt
-from PySide6.QtGui import QCloseEvent, QIcon
+import html
+import threading
+
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -15,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from neis_v4 import APP_DISPLAY_NAME, APP_VERSION_LABEL
+from neis_v4 import APP_DISPLAY_NAME, APP_VERSION_LABEL, __version__
 from neis_v4.models import AppSettings
 from neis_v4.roster import StudentRoster
 from neis_v4.secrets import SecretStore
@@ -25,9 +29,13 @@ from neis_v4.ui.behavior_tab import BehaviorTab
 from neis_v4.ui.neis_tab import NeisTab
 from neis_v4.ui.settings_tab import SettingsTab
 from neis_v4.ui.theme import COLORS, STYLE_SHEET, icon
+from neis_v4.updates import fetch_latest_release, is_newer
 
 
 class MainWindow(QMainWindow):
+    # 새 버전을 찾으면 (태그, 내려받기 페이지 주소)를 보냅니다. 확인은 뒤에서 하고 결과만 화면으로 넘깁니다.
+    update_found = Signal(str, str)
+
     def __init__(self) -> None:
         super().__init__()
         self.storage = Storage()
@@ -72,8 +80,15 @@ class MainWindow(QMainWindow):
         self.ai_tab.api_keys_changed.connect(self._refresh_api_keys)
         self.behavior_tab.api_keys_changed.connect(self._refresh_api_keys)
         self.settings_tab.api_keys_changed.connect(self._refresh_api_keys)
-        self.ai_tab.comments_ready.connect(self.neis_tab.put_comments)
+        self.ai_tab.comment_sink = self.neis_tab.receive_ai_comments
         self.behavior_tab.comments_ready.connect(self.neis_tab.put_comments_by_id)
+        self.ai_tab.auto_input_requested.connect(self._input_ai_comments)
+        self.behavior_tab.auto_input_requested.connect(self._input_behavior_comments)
+        for tab in (self.ai_tab, self.behavior_tab):
+            tab.stop_input_requested.connect(self.neis_tab.stop_or_cancel)
+            self.neis_tab.macro_status_changed.connect(tab.set_macro_status)
+
+        self.update_found.connect(self._on_update_found)
 
         self.setStyleSheet(STYLE_SHEET)
         self._select_page(0)
@@ -102,6 +117,7 @@ class MainWindow(QMainWindow):
 
         version = QLabel(APP_VERSION_LABEL)
         version.setObjectName("SidebarCaption")
+        self.version_label = version
         sidebar_layout.addWidget(version)
 
         layout.addWidget(sidebar)
@@ -155,16 +171,70 @@ class MainWindow(QMainWindow):
             self._fade_page = None
             self._fade_animation = None
 
+    def check_for_updates(self) -> None:
+        """새 버전이 있는지 뒤에서 확인합니다. 인터넷이 안 되면 아무것도 띄우지 않습니다."""
+
+        def check() -> None:
+            try:
+                tag, url = fetch_latest_release()
+                if is_newer(tag, __version__):
+                    self.update_found.emit(tag, url)
+            except Exception:
+                pass  # 오프라인·학교망 차단·창을 먼저 닫은 경우 모두 조용히 넘어갑니다.
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _on_update_found(self, tag: str, url: str) -> None:
+        self.version_label.setText(
+            f'{APP_VERSION_LABEL}<br><a href="{html.escape(url, quote=True)}">새 버전 {html.escape(tag)} 받기</a>'
+        )
+        self.version_label.setOpenExternalLinks(True)
+        self.version_label.setToolTip("누르면 내려받기 페이지가 열립니다.")
+        if self.settings.notified_update_version == tag:
+            return  # 안내 창은 버전마다 한 번만 띄웁니다.
+        if self.neis_tab.input_state() != "idle":
+            return  # 자동 입력 중에 창이 뜨면 붙여넣기가 그 창으로 갑니다. 다음 실행 때 알립니다.
+        self.settings.notified_update_version = tag
+        self.save_settings()
+        box = QMessageBox(
+            QMessageBox.Information,
+            "새 버전이 나왔습니다",
+            f"새 버전 {tag}이(가) 나왔습니다. 지금 쓰는 버전은 {APP_VERSION_LABEL}입니다.\n\n"
+            "내려받기 페이지에서 새 실행 파일을 받아 쓰세요. 작업 내용과 설정, API 키는 그대로 남습니다.\n"
+            "왼쪽 아래 '새 버전 받기'를 눌러도 언제든 페이지를 열 수 있습니다.",
+            parent=self,
+        )
+        open_page = box.addButton("내려받기 페이지 열기", QMessageBox.AcceptRole)
+        box.addButton("나중에", QMessageBox.RejectRole)
+        box.setDefaultButton(open_page)
+        box.exec()
+        if box.clickedButton() is open_page:
+            QDesktopServices.openUrl(QUrl(url))
+
     def apply_settings(self) -> None:
         self.setWindowFlag(Qt.WindowStaysOnTopHint, self.settings.always_on_top)
         self.show()
         self.ai_tab.refresh_from_settings()
         self.behavior_tab.refresh_from_settings()
+        self.neis_tab.refresh_lengths()
         self.save_settings()
 
     def _on_runtime_settings_changed(self) -> None:
         self.settings_tab.refresh_from_settings()
         self.save_settings()
+
+    def _input_ai_comments(self, comments: list[str], tab_count: int) -> None:
+        """결과 칸에 보이는 그대로 1번 행부터 덮어쓰고(Ctrl+Z로 되돌리기 가능) 그 행들만 입력합니다."""
+        if self.neis_tab.input_state() != "idle":
+            return
+        self.neis_tab.put_comments(comments)
+        self.neis_tab.start_macro(self.neis_tab.rows()[: len(comments)], tab_count)
+
+    def _input_behavior_comments(self, drafts: dict[str, str], rows: list, tab_count: int) -> None:
+        if self.neis_tab.input_state() != "idle":
+            return
+        self.neis_tab.put_comments_by_id(drafts)
+        self.neis_tab.start_macro(rows, tab_count)
 
     def _refresh_api_keys(self) -> None:
         self.ai_tab.refresh_api_keys()
@@ -175,7 +245,44 @@ class MainWindow(QMainWindow):
         self.storage.save_settings(self.settings)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self.save_settings()
-        self.storage.save_students(self.neis_tab.rows())
-        self.behavior_tab.save_work()
+        # AI 요청은 중간에 끊을 수 없으므로 끝날 때까지 닫기를 미룹니다.
+        if self.ai_tab.is_busy() or self.behavior_tab.worker:
+            QMessageBox.information(
+                self,
+                "AI 생성 중",
+                "AI 문장을 생성하는 중입니다. 취소한 요청도 응답이 올 때까지 기다립니다.\n생성이 끝난 뒤 다시 닫아 주세요.\n"
+                "행동발달은 '생성 중지'를 누르면 이미 보낸 묶음까지만 받고 멈춥니다.",
+            )
+            event.ignore()
+            return
+        runner = self.neis_tab.runner
+        if runner:
+            runner.stop()
+            runner.wait(5000)
+
+        # 하나가 실패해도 나머지는 저장되도록 따로 시도합니다.
+        failures = []
+        for label, save in (
+            ("환경 설정", self.save_settings),
+            ("NEIS 입력 표 (data.csv)", lambda: self.storage.save_students(self.neis_tab.rows())),
+            ("행동발달 작업", self.behavior_tab.save_work),
+        ):
+            try:
+                save()
+            except Exception as exc:
+                failures.append(f"· {label}: {exc}")
+        if failures:
+            answer = QMessageBox.warning(
+                self,
+                "저장 실패",
+                "다음 항목을 저장하지 못했습니다.\n"
+                "엑셀 등 다른 프로그램에서 파일을 열어 두었다면 닫고 다시 시도하세요.\n\n"
+                + "\n".join(failures)
+                + "\n\n저장하지 않고 닫을까요?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
         super().closeEvent(event)

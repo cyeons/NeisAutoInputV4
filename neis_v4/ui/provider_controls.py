@@ -3,7 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QComboBox, QWidget
 
-from neis_v4.ai.model_catalog import PROVIDERS, normalize_model, provider_spec
+from neis_v4.ai.model_catalog import PROVIDERS, models_for, normalize_model
 from neis_v4.secrets import SecretStore
 from neis_v4.ui.widgets import ArrowComboBox, ChoiceSegmentedControl
 
@@ -44,7 +44,7 @@ class ModelSelector(ArrowComboBox):
         selected_model_id = normalize_model(provider, selected_model_id)
         self.blockSignals(True)
         self.clear()
-        for model in provider_spec(provider).models:
+        for model in models_for(provider):
             self.addItem(model.display_name, model.model_id)
             index = self.count() - 1
             self.setItemData(index, model.model_id, 3)

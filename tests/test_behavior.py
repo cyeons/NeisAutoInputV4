@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import QApplication
 
 from neis_v4.ai.behavior_prompt import BEHAVIOR_RESPONSE_SCHEMA, build_behavior_prompt
@@ -395,8 +396,46 @@ class BehaviorUiSmokeTests(unittest.TestCase):
             tab._apply_results()
 
             self.assertEqual(applied, [{row.student_id: short_draft}])
-            self.assertEqual(tab.result_info.text(), "생성 완료")
+            self.assertTrue(tab.result_info.text().startswith("생성 완료"))
+            self.assertIn("분량 확인 필요", tab.result_info.text())
             self.assertFalse(hasattr(tab, "apply_check"))
+            tab.close()
+
+
+    def test_editing_draft_keeps_typed_text_and_apply_uses_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            rows = [StudentRow("학생 1"), StudentRow("학생 2")]
+            # 특성을 바꾼 뒤처럼 초안은 있지만 '생성 전' 상태인 학생
+            work = BehaviorWork(
+                students=[BehaviorStudentState(rows[0].student_id, draft="기존 문장임.", status="not_generated")]
+            )
+            tab = BehaviorTab(Storage(Path(temporary)), AppSettings(), FakeSecrets(), StudentRoster(rows), work)
+            cursor = tab.draft.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            tab.draft.setTextCursor(cursor)
+            # 한 글자씩 칩니다. (QTest.keyClicks는 한글을 보내지 못해 insertPlainText를 씁니다.)
+            tab.draft.insertPlainText("추")
+            tab.draft.insertPlainText("가")
+            self.assertEqual(tab.draft.toPlainText(), "기존 문장임.추가")
+
+            applied = []
+            tab.comments_ready.connect(applied.append)
+            tab._apply_results()
+            self.assertEqual(applied, [{rows[0].student_id: "기존 문장임.추가"}])
+            # 넣기를 눌러도 생성 중인 학생의 상태는 그대로입니다.
+            tab.states[rows[0].student_id].status = "generating"
+            tab._apply_results()
+            self.assertEqual(tab.states[rows[0].student_id].status, "generating")
+            tab.states[rows[0].student_id].status = "ok"
+
+            requested = []
+            tab.auto_input_requested.connect(lambda *args: requested.append(args))
+            tab.input_controls.button.click()
+            drafts, input_rows, tab_count = requested[0]
+            self.assertEqual(drafts, {rows[0].student_id: "기존 문장임.추가"})
+            # 초안이 없는 학생은 빈 행으로 보내 표에 남은 다른 내용이 들어가지 않게 합니다.
+            self.assertEqual([row.content for row in input_rows], ["기존 문장임.추가", ""])
+            self.assertEqual(tab_count, 2)
             tab.close()
 
 
@@ -414,7 +453,8 @@ class BehaviorWorkerTests(unittest.TestCase):
 
             def generate_behavior(self, batch_request):
                 self.calls += 1
-                if self.calls == 2:
+                # 묶음을 동시에 보내므로 호출 순서 대신 학생으로 실패할 묶음을 정합니다.
+                if any(student.student_id == "2" for student in batch_request.students):
                     raise RuntimeError("invalid request")
                 return type(
                     "Generated",
@@ -492,6 +532,9 @@ class BehaviorWorkerTests(unittest.TestCase):
             patch.object(BehaviorGenerationWorker, "msleep", return_value=None),
         ):
             worker.run()
+        # 재시도 안내는 묶음 처리 스레드에서 보내므로 화면 스레드 이벤트를 처리해야 도착합니다.
+        app = QApplication.instance() or QApplication([])
+        app.processEvents()
 
         self.assertEqual(provider.calls, 2)
         self.assertEqual(captured[0].results[0].status, "ok")

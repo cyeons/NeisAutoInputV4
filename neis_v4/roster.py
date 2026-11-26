@@ -18,8 +18,13 @@ class StudentRoster(QObject):
         return [StudentRow(row.name, row.content, row.student_id) for row in self._rows]
 
     def replace(self, rows: list[StudentRow], emit: bool = True) -> None:
+        # changed는 명단(이름·순서·학생 수)이 바뀔 때만 보냅니다. 평어 내용만 고친 경우
+        # 행동발달 화면이 명단을 다시 그리고 작업 파일을 다시 저장할 필요가 없습니다.
+        names_changed = [(row.name, row.student_id) for row in rows] != [
+            (row.name, row.student_id) for row in self._rows
+        ]
         self._rows = list(rows)
-        if emit:
+        if emit and names_changed:
             self.changed.emit()
 
     def update_from_rows(self, rows: list[StudentRow]) -> None:

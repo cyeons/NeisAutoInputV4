@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 
+from PySide6.QtCore import QLibraryInfo, QTranslator
 from PySide6.QtGui import QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -38,6 +39,10 @@ def run() -> int:
     startup_settings = Storage().load_settings()
     configure_windows_trust_store(startup_settings.use_windows_trust_store)
     app = QApplication(sys.argv)
+    # 확인 창의 Yes/No/OK/Cancel 버튼을 '예/아니요/확인/취소'로 보여 줍니다. 파일이 없으면 영어로 둡니다.
+    translator = QTranslator(app)
+    if translator.load("qtbase_ko", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
+        app.installTranslator(translator)
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setFont(_application_font())
@@ -56,4 +61,5 @@ def run() -> int:
             available.y() + (available.height() - height) // 2,
         )
     window.show()
+    window.check_for_updates()
     return app.exec()

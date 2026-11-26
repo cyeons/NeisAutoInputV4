@@ -314,7 +314,7 @@ def browser_mock(number: int) -> str:
           <div class="browser-bar"><span></span><span></span><span></span><div>🔒 platform.openai.com</div></div>
           <div class="web-body"><div class="web-brand">OpenAI Platform</div><h3>{title}</h3>
           <div class="web-button">{action}</div>
-          <div class="web-row">Project <b>NeisAutoInputV4</b></div>
+          <div class="web-row">Project <b>NEISAutoInput</b></div>
           <div class="web-safe">계정·결제·키 정보는 흐림 처리합니다</div></div>
         </div>"""
     return ""
@@ -325,17 +325,17 @@ def cover_page() -> str:
     <section class="page cover">
       <div class="cover-copy">
         <div class="cover-badge">교사를 위한 쉬운 시작 안내서</div>
-        <h1>NeisAutoInputV4</h1>
+        <h1>NEISAutoInput</h1>
         <h2>평어 및 행동특성<br>자동 입력 및 AI 생성기</h2>
         <p>학생별 내용을 준비하고 NEIS에 안전하게<br>자동 입력하는 방법을 안내합니다.</p>
       </div>
-      <div class="cover-shot"><img src="./assets/screens/01-data-ready.png" alt="NeisAutoInputV4 자동 입력 화면"></div>
+      <div class="cover-shot"><img src="./assets/screens/01-data-ready.png" alt="NEISAutoInput 자동 입력 화면"></div>
       <div class="cover-flow">
         <div><b>1</b><span>데이터 준비</span></div><i>›</i>
         <div><b>2</b><span>입력 설정</span></div><i>›</i>
         <div><b>3</b><span>자동 입력</span></div>
       </div>
-      <footer><span>NeisAutoInputV4 사용 설명서</span><span>01 / 34</span></footer>
+      <footer><span>NEISAutoInput 사용 설명서</span><span>01 / 34</span></footer>
     </section>
     """
 
@@ -371,7 +371,7 @@ def page_html(number: int, title: str, markdown: str) -> str:
     return f"""
     <section class="page{density}{no_visual}{flow_overview}" data-slide="{number}" data-marker-count="{len(MARKERS.get(number, []))}" data-callout-count="{len(CALLOUTS.get(number, []))}">
       <header>
-        <div class="brand"><span>N</span> NeisAutoInputV4</div>
+        <div class="brand"><span>N</span> NEISAutoInput</div>
         <div class="chapter">{section_name(number)}</div>
       </header>
       <div class="title-row"><div class="step">{number:02d}</div><h2>{html.escape(title)}</h2></div>
@@ -464,7 +464,7 @@ def build() -> None:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NeisAutoInputV4 사용 설명서</title>
+  <title>NEISAutoInput 사용 설명서</title>
   <style>{STYLE}</style>
 </head>
 <body>

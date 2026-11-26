@@ -14,18 +14,42 @@ class AppSettings:
     start_hotkey: str = "F8"
     hotkey_start_enabled: bool = False
     tab_count: int = 2
+    # AI 평어·행동발달 화면에서 바로 입력할 때의 이동 칸 (교과 평어는 Tab 3번, 행발은 Tab 2번)
+    ai_tab_count: int = 3
+    behavior_tab_count: int = 2
+    # NEIS 입력칸 최대 바이트(한글 1자 = 3byte). 초과한 행을 표에서 빨간색으로 표시합니다.
+    content_byte_limit: int = 1500
     leading_space: bool = False
     pyautogui_failsafe: bool = True
     use_windows_trust_store: bool = True
-    ai_provider: str = "Gemini"
-    gemini_model: str = "gemini-3.5-flash"
-    openai_model: str = "gpt-5.4-mini"
-    behavior_provider: str = "Gemini"
-    behavior_gemini_model: str = "gemini-3.5-flash"
-    behavior_openai_model: str = "gpt-5.4-mini"
+    ai_provider: str = "Upstage"
+    upstage_model: str = "solar-pro4"
+    gemini_model: str = "gemini-3.5-flash-lite"
+    openai_model: str = "gpt-6-luna"
+    claude_model: str = "claude-haiku-5-5"
+    behavior_provider: str = "Upstage"
+    behavior_upstage_model: str = "solar-pro4"
+    behavior_gemini_model: str = "gemini-3.5-flash-lite"
+    behavior_openai_model: str = "gpt-6-luna"
+    behavior_claude_model: str = "claude-haiku-5-5"
     behavior_sentence_count: int = 3
     ai_custom_prompt: str = ""
     behavior_custom_prompt: str = ""
+    # 새 버전 안내 창을 이미 띄운 버전 (같은 버전은 한 번만 알립니다)
+    notified_update_version: str = ""
+
+    @staticmethod
+    def _model_field(provider: str, behavior: bool) -> str:
+        # 예: "Gemini" → gemini_model, 행동발달용은 behavior_gemini_model
+        return f"{'behavior_' if behavior else ''}{provider.lower()}_model"
+
+    def model_for(self, provider: str, *, behavior: bool = False) -> str:
+        return str(getattr(self, self._model_field(provider, behavior), ""))
+
+    def set_model(self, provider: str, model_id: str, *, behavior: bool = False) -> None:
+        field_name = self._model_field(provider, behavior)
+        if hasattr(self, field_name):
+            setattr(self, field_name, model_id)
 
 
 @dataclass

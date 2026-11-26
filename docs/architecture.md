@@ -43,9 +43,10 @@ V4 is a new PySide6 project under `NeisAutoInputV4`.
 - `neis_v4/ui/` contains tab-specific UI classes.
 - `neis_v4/models.py` contains dataclass models for settings, student rows, standards, and AI requests.
 - `neis_v4/storage.py` owns JSON, CSV, resource, and user-data paths.
-- `neis_v4/secrets.py` stores API keys through `keyring`.
-- `neis_v4/ai/` contains a provider interface plus Gemini and OpenAI implementations.
-- `neis_v4/automation/runner.py` runs NEIS input automation in a `QThread`.
+- `neis_v4/secrets.py` stores API keys through `keyring`. For Upstage it falls back to an obfuscated bundled key (`neis_v4/_bundled_key.py`, generated from `.env` at build time, git-ignored) until `BUNDLED_KEY_EXPIRES`.
+- `neis_v4/ai/` contains a provider interface plus Upstage (Solar models), Gemini, OpenAI and Claude (Anthropic) implementations. Solar reuses the OpenAI provider with a different `base_url`; for behavior comments it requests each student separately and asks for a sentence array, because Solar breaks sentence counts in paragraph mode. For subject comments Solar also gets the user's extra instruction in its system `instructions`, because it follows it more reliably there.
+- `neis_v4/automation/runner.py` runs NEIS input automation in a `QThread`. The AI and behavior tabs reuse `NeisTab.start_macro(rows, tab_count)` for their own "NEIS 자동 입력" button and mirror its state through `NeisTab.macro_status_changed`.
+- `neis_v4/updates.py` reads the latest GitHub Release tag; `MainWindow.check_for_updates` runs it in a background thread at startup (called from `app.run`, so tests never touch the network).
 
 ## V4 Runtime Files
 

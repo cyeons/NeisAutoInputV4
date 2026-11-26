@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
 import random
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import replace
 
 from PySide6.QtCore import QPoint, QSize, Qt, QThread, QTimer, Signal
@@ -25,9 +28,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neis_v4.ai.base import call_with_retry, is_transient_error
 from neis_v4.ai.behavior_response import comment_metrics
+from neis_v4.ai.claude_provider import ClaudeProvider
 from neis_v4.ai.gemini_provider import GeminiProvider
 from neis_v4.ai.openai_provider import OpenAIProvider
+from neis_v4.ai.solar_provider import SolarProvider
 from neis_v4.behavior_catalog import BehaviorCatalog
 from neis_v4.models import (
     AppSettings,
@@ -38,9 +44,10 @@ from neis_v4.models import (
     BehaviorStudentState,
     BehaviorTraitSelection,
     BehaviorWork,
+    StudentRow,
 )
 from neis_v4.roster import StudentRoster
-from neis_v4.secrets import SecretStore
+from neis_v4.secrets import SecretStore, no_key_message
 from neis_v4.storage import Storage
 from neis_v4.ui.api_keys import ApiKeyManagerDialog
 from neis_v4.ui.provider_controls import ModelSelector, ProviderSelector
@@ -49,6 +56,8 @@ from neis_v4.ui.widgets import (
     ArrowComboBox,
     ChoiceSegmentedControl,
     CompactNumberInput,
+    NeisInputControls,
+    estimated_progress,
     set_faded_text,
 )
 
@@ -65,71 +74,129 @@ LEVEL_COLORS = {
 }
 
 
+# 행동발달 묶음(10명)을 몇 개까지 동시에 보낼지 정합니다.
+# 동시에 처리 중인 묶음끼리는 서로의 문장을 중복 방지 참고로 쓰지 못합니다.
+PARALLEL_BATCHES = 3
+
+# '한 번에 보내는 최대 30명' 1회당 예상 시간(초). 진행률(%) 어림에 씁니다.
+# 2026-11 가짜 학생 10~35명으로 잰 값(Upstage 15~28초, Gemini 3.8 Flash 23~285초로 날마다 들쭉날쭉)이고,
+# 재지 못한 서비스는 대략값입니다. 생성할 때마다 실제 걸린 시간으로 보정합니다.
+SECONDS_PER_WAVE = {"Upstage": 20.0, "Gemini": 90.0}
+DEFAULT_SECONDS_PER_WAVE = 40.0
+
+
 class BehaviorGenerationWorker(QThread):
     succeeded = Signal(object)
     failed = Signal(str)
     progress_changed = Signal(int, int)
     status_changed = Signal(str)
+    # 묶음 하나가 끝날 때마다 그 묶음 결과를 보내 화면에 바로 보여 줍니다.
+    batch_finished = Signal(object)
 
     def __init__(
         self,
         request: BehaviorGenerationRequest,
         api_key: str,
         batch_size: int = 10,
+        parallel_batches: int = PARALLEL_BATCHES,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.request = request
         self.api_key = api_key
         self.batch_size = batch_size
+        self.parallel_batches = max(1, parallel_batches)
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        """이미 보낸 묶음은 끝까지 받고, 다음 묶음부터 보내지 않습니다."""
+        self._stop_requested = True
 
     def run(self) -> None:
         try:
-            provider = (
-                GeminiProvider(self.api_key)
-                if self.request.provider == "Gemini"
-                else OpenAIProvider(self.api_key)
-            )
-            results = []
-            raw_parts: list[str] = []
-            total = len(self.request.students)
+            providers = {
+                "Gemini": GeminiProvider,
+                "OpenAI": OpenAIProvider,
+                "Claude": ClaudeProvider,
+                "Upstage": SolarProvider,
+            }
+            provider = providers[self.request.provider](self.api_key)
+            students = self.request.students
+            total = len(students)
+            batches = [
+                students[start : start + self.batch_size]
+                for start in range(0, total, self.batch_size)
+            ]
             previous = list(self.request.previous_outputs)
-            for start in range(0, total, self.batch_size):
-                students = self.request.students[start : start + self.batch_size]
-                batch_request = replace(self.request, students=students, previous_outputs=previous)
-                try:
-                    generated = self._generate_batch_with_retry(
-                        provider, batch_request, start // self.batch_size + 1
-                    )
-                except Exception as exc:
-                    message = f"{start // self.batch_size + 1}번째 묶음 생성 실패: {exc}"
-                    results.extend(
-                        BehaviorStudentResult(
-                            student_id=student.student_id,
-                            status="failed",
-                            reason=message,
-                            comment="",
+            results_by_batch: dict[int, list[BehaviorStudentResult]] = {}
+            raw_parts: list[str] = []
+            done = 0
+            # 최대 3묶음을 동시에 보내고, 하나가 끝나면 곧바로 다음 묶음을 보냅니다.
+            # (예전에는 3묶음이 모두 끝나야 다음 3묶음을 보내서 느린 묶음 하나가 전체를 붙잡았습니다.)
+            # 새로 보내는 묶음은 그때까지 끝난 묶음의 문장을 중복 방지 참고로 받습니다.
+            pending: dict = {}
+            next_index = 0
+            with ThreadPoolExecutor(self.parallel_batches) as pool:
+                while True:
+                    while (
+                        next_index < len(batches)
+                        and len(pending) < self.parallel_batches
+                        and not self._stop_requested
+                    ):
+                        future = pool.submit(
+                            self._run_batch, provider, next_index, batches[next_index], list(previous)
                         )
-                        for student in students
-                    )
-                    self.progress_changed.emit(min(start + len(students), total), total)
-                    continue
-                results.extend(generated.results)
-                raw_parts.append(generated.raw_text)
-                previous.extend(
-                    item.comment
-                    for item in generated.results
-                    if item.status == "ok" and item.comment
-                )
-                self.progress_changed.emit(min(start + len(students), total), total)
+                        pending[future] = next_index
+                        next_index += 1
+                    if not pending:
+                        break
+                    finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in finished:
+                        index = pending.pop(future)
+                        results_by_batch[index], raw_text = future.result()
+                        if raw_text:
+                            raw_parts.append(raw_text)
+                        previous.extend(
+                            item.comment
+                            for item in results_by_batch[index]
+                            if item.status == "ok" and item.comment
+                        )
+                        self.batch_finished.emit(results_by_batch[index])
+                        done += len(batches[index])
+                        self.progress_changed.emit(done, total)
             self.succeeded.emit(
                 BehaviorGenerationResult(
-                    results=results,
+                    results=[item for index in sorted(results_by_batch) for item in results_by_batch[index]],
                     raw_text="\n".join(raw_parts),
                 )
             )
         except Exception as exc:
             self.failed.emit(str(exc))
+
+    def _run_batch(
+        self,
+        provider,
+        index: int,
+        students: list[BehaviorStudentInput],
+        previous: list[str],
+    ) -> tuple[list[BehaviorStudentResult], str]:
+        """한 묶음을 생성합니다. 실패해도 예외 대신 학생별 실패 결과를 돌려줘 다른 묶음은 살립니다."""
+        batch_request = replace(self.request, students=students, previous_outputs=previous)
+        try:
+            generated = self._generate_batch_with_retry(provider, batch_request, index + 1)
+            return list(generated.results), generated.raw_text
+        except Exception as exc:
+            message = f"{index + 1}번째 묶음 생성 실패: {exc}"
+            failed = [
+                BehaviorStudentResult(
+                    student_id=student.student_id,
+                    status="failed",
+                    reason=message,
+                    comment="",
+                )
+                for student in students
+            ]
+            return failed, ""
 
     def _generate_batch_with_retry(
         self,
@@ -137,43 +204,24 @@ class BehaviorGenerationWorker(QThread):
         request: BehaviorGenerationRequest,
         batch_number: int,
     ) -> BehaviorGenerationResult:
-        for attempt in range(3):
-            try:
-                return provider.generate_behavior(request)
-            except Exception as exc:
-                if attempt >= 2 or not self._is_transient_error(exc):
-                    raise
-                delay_seconds = 1.2 * (2**attempt)
-                self.status_changed.emit(
-                    f"{batch_number}번째 묶음 서버 혼잡 · {attempt + 1}/2회 재시도 중"
-                )
-                self.msleep(int(delay_seconds * 1000))
-        raise RuntimeError("행동발달 묶음 생성 재시도에 실패했습니다.")
-
-    @staticmethod
-    def _is_transient_error(exc: Exception) -> bool:
-        message = str(exc).lower()
-        return any(
-            token in message
-            for token in (
-                "429",
-                "500",
-                "502",
-                "503",
-                "504",
-                "unavailable",
-                "high demand",
-                "rate limit",
-                "temporarily",
-                "timeout",
-            )
+        return call_with_retry(
+            lambda: provider.generate_behavior(request),
+            on_retry=lambda attempt, limit: self.status_changed.emit(
+                f"{batch_number}번째 묶음 서버 혼잡 · {attempt}/{limit}회 재시도 중"
+            ),
+            sleep=lambda seconds: self.msleep(int(seconds * 1000)),
         )
+
+    _is_transient_error = staticmethod(is_transient_error)
 
 
 class BehaviorTab(QWidget):
     comments_ready = Signal(dict)
     settings_changed = Signal()
     api_keys_changed = Signal()
+    # 바로 NEIS 자동 입력: (학생별 초안, 명단 순서의 입력할 행, 이동 칸)
+    auto_input_requested = Signal(dict, list, int)
+    stop_input_requested = Signal()
 
     def __init__(
         self,
@@ -200,9 +248,23 @@ class BehaviorTab(QWidget):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(450)
         self._save_timer.timeout.connect(self.save_work)
+        # 생성 진행률: 묶음이 끝날 때마다 실제 값, 그 사이는 경과 시간으로 어림합니다.
+        self._started_at = 0.0
+        self._expected_seconds = 0.0
+        self._waves = 1
+        self._timing_key = ("", "")
+        self._done = 0
+        self._total = 0
+        self._status_note = ""
+        self._seconds_per_wave: dict[tuple[str, str], float] = {}
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.setInterval(1000)
+        self._elapsed_timer.timeout.connect(self._update_elapsed)
 
         self.provider = ProviderSelector()
         self.model = ModelSelector()
+        # 좁은 창에서는 모델 칸이 줄어들도록 합니다.
+        self.model.setMinimumContentsLength(8)
         default_count = work.default_sentence_count or settings.behavior_sentence_count
         self.default_sentence_count = CompactNumberInput(
             1,
@@ -223,6 +285,8 @@ class BehaviorTab(QWidget):
         self.student_filter.addItem("실패", "failed")
         self.student_list = QListWidget()
         self.student_list.setMinimumWidth(170)
+        # 항목이 목록 폭에 맞춰지도록 가로 스크롤을 끕니다 (켜 두면 상태 표시가 오른쪽에서 잘림).
+        self.student_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         self.group_combo = ChoiceSegmentedControl(
             [("교과", "subject"), ("인성·행동·태도", "behavior")]
@@ -256,6 +320,8 @@ class BehaviorTab(QWidget):
         self.reset_sentence_override.setAccessibleName("개별 문장 수 기본값 사용")
         self.draft = QTextEdit()
         self.draft.setPlaceholderText("생성된 행동특성 및 종합의견이 여기에 표시됩니다.")
+        # 1366×768 화면에서 선택한 특성 목록에 밀려 한 줄만 보이지 않게 합니다 (여기서 결과를 고칩니다).
+        self.draft.setMinimumHeight(130)
         self.custom_prompt_toggle = QPushButton("▸ 사용자 프롬프트")
         self.custom_prompt_toggle.setCheckable(True)
         self.custom_prompt_toggle.setProperty("variant", "ghost")
@@ -276,9 +342,15 @@ class BehaviorTab(QWidget):
         self.generate_all = QPushButton("전체 생성")
         self.generate_all.setProperty("variant", "primary")
         self.generate_all.setIcon(icon("sparkles", "#FFFFFF"))
-        self.apply_button = QPushButton("생성 결과 적용")
+        self.stop_button = QPushButton("생성 중지")
+        self.stop_button.setProperty("variant", "secondary")
+        self.stop_button.setIcon(icon("square", COLORS["muted"]))
+        self.stop_button.setToolTip("이미 보낸 묶음까지만 받고 나머지 학생은 생성하지 않습니다.")
+        self.stop_button.setVisible(False)
+        self.apply_button = QPushButton("NEIS 표에 넣기")
         self.apply_button.setProperty("variant", "secondary")
         self.apply_button.setIcon(icon("arrow-right", COLORS["muted"]))
+        self.input_controls = NeisInputControls(settings.behavior_tab_count)
         self.save_button = QPushButton("작업 저장")
         self.save_button.setProperty("variant", "secondary")
         self.save_button.setIcon(icon("save", COLORS["muted"]))
@@ -309,17 +381,24 @@ class BehaviorTab(QWidget):
 
         toolbar = QFrame()
         toolbar.setProperty("role", "Toolbar")
-        toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(12, 10, 12, 10)
-        toolbar_layout.addWidget(QLabel("AI 서비스"))
-        toolbar_layout.addWidget(self.provider)
-        toolbar_layout.addWidget(QLabel("모델"))
-        toolbar_layout.addWidget(self.model, 2)
-        toolbar_layout.addWidget(self.key_status)
-        toolbar_layout.addWidget(self.key_button)
-        toolbar_layout.addSpacing(8)
-        toolbar_layout.addWidget(QLabel("전체 기본"))
-        toolbar_layout.addWidget(self.default_sentence_count)
+        toolbar_layout = QVBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(12, 8, 12, 8)
+        toolbar_layout.setSpacing(6)
+        # 서비스가 4개라 한 줄에 모두 넣으면 1366×768 화면에서 글자가 잘려 두 줄로 나눕니다.
+        service_row = QHBoxLayout()
+        service_row.addWidget(QLabel("AI 서비스"))
+        service_row.addWidget(self.provider)
+        service_row.addSpacing(8)
+        service_row.addWidget(QLabel("모델"))
+        service_row.addWidget(self.model, 1)
+        key_row = QHBoxLayout()
+        key_row.addWidget(self.key_status)
+        key_row.addWidget(self.key_button)
+        key_row.addStretch(1)
+        key_row.addWidget(QLabel("전체 기본 문장 수"))
+        key_row.addWidget(self.default_sentence_count)
+        toolbar_layout.addLayout(service_row)
+        toolbar_layout.addLayout(key_row)
         root.addWidget(toolbar)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -344,7 +423,9 @@ class BehaviorTab(QWidget):
         buttons = QHBoxLayout()
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.apply_button)
+        buttons.addWidget(self.input_controls)
         buttons.addStretch(1)
+        buttons.addWidget(self.stop_button)
         buttons.addWidget(self.generate_current)
         buttons.addWidget(self.generate_all)
         dock_layout.addLayout(buttons)
@@ -441,10 +522,14 @@ class BehaviorTab(QWidget):
         self.key_button.clicked.connect(self._manage_api_keys)
         self.generate_current.clicked.connect(lambda: self._generate(False))
         self.generate_all.clicked.connect(lambda: self._generate(True))
+        self.stop_button.clicked.connect(self._stop_generation)
         self.apply_button.clicked.connect(self._apply_results)
         self.save_button.clicked.connect(self._save_now)
         self.custom_prompt_toggle.toggled.connect(self._toggle_custom_prompt)
         self.custom_prompt.textChanged.connect(self._on_custom_prompt_changed)
+        self.input_controls.start_requested.connect(self._request_auto_input)
+        self.input_controls.stop_requested.connect(self.stop_input_requested.emit)
+        self.input_controls.tab_count_changed.connect(self._on_input_tab_count_changed)
 
     def _ensure_states(self) -> None:
         for row in self.roster.rows():
@@ -463,7 +548,11 @@ class BehaviorTab(QWidget):
         selected_item = None
         for row in self.roster.rows():
             state = self.states[row.student_id]
-            if state.status == "ok":
+            if state.status == "generating":
+                marker = "생성 중"
+                status_key = "ready"
+                badge = "warning"
+            elif state.status == "ok":
                 marker = "완료"
                 status_key = "ok"
                 badge = "success"
@@ -485,7 +574,7 @@ class BehaviorTab(QWidget):
                 continue
             item = QListWidgetItem()
             item.setData(Qt.UserRole, row.student_id)
-            item.setSizeHint(QSize(190, 46))
+            item.setSizeHint(QSize(0, 46))
             self.student_list.addItem(item)
             widget = QWidget()
             widget.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -528,7 +617,12 @@ class BehaviorTab(QWidget):
         )
 
     def _on_student_changed(self, current: QListWidgetItem | None, _previous) -> None:
-        self.current_student_id = str(current.data(Qt.UserRole)) if current else ""
+        student_id = str(current.data(Qt.UserRole)) if current else ""
+        if student_id and student_id == self.current_student_id:
+            # 명단만 다시 그린 경우입니다. 결과 칸을 다시 불러오면 고치던 글의 커서가 맨 앞으로 튀고
+            # 조합 중인 한글이 사라지므로 그대로 둡니다. (상태가 바뀌는 곳은 _load_current를 따로 부릅니다.)
+            return
+        self.current_student_id = student_id
         self._load_current()
         self._refresh_trait_buttons()
 
@@ -831,6 +925,7 @@ class BehaviorTab(QWidget):
         state = self._current_state()
         if not state:
             return
+        old_status = state.status
         state.draft = self.draft.toPlainText().strip()
         if not state.draft:
             state.status = "not_generated"
@@ -839,7 +934,9 @@ class BehaviorTab(QWidget):
             state.status = "ok"
             state.error_message = ""
         self._show_result_info(state)
-        self._refresh_students()
+        # 글자 하나 칠 때마다 명단 전체를 다시 그리면 타자가 밀리므로, 완료/빈칸 표시가 바뀔 때만 그립니다.
+        if state.status != old_status:
+            self._refresh_students()
         self._schedule_save()
 
     def _show_result_info(self, state: BehaviorStudentState) -> None:
@@ -851,6 +948,12 @@ class BehaviorTab(QWidget):
         if state.status == "failed" and state.error_message:
             self.result_info.setText(f"생성 실패\n⚠ {state.error_message}")
             self.result_info.setStyleSheet("color:#B42318;")
+        elif state.draft and not 250 <= metrics["character_count"] <= 280:
+            # behavior_prompt.py의 '250자 이상 280자 이하' 규칙과 맞춥니다.
+            count = metrics["character_count"]
+            gap = f"{250 - count}자 짧음" if count < 250 else f"{count - 280}자 김"
+            self.result_info.setText(f"생성 완료\n⚠ 분량 확인 필요: 권장 250~280자보다 {gap}")
+            self.result_info.setStyleSheet("color:#B54708;")
         elif state.draft:
             self.result_info.setText("생성 완료")
             self.result_info.setStyleSheet("color:#17803D;")
@@ -872,11 +975,9 @@ class BehaviorTab(QWidget):
             self.model.clear()
             self.model.setEnabled(False)
             return
-        if provider == "Gemini":
-            value = self.settings.behavior_gemini_model
-        else:
-            value = self.settings.behavior_openai_model
-        selected = self.model.set_provider(provider, value)
+        selected = self.model.set_provider(
+            provider, self.settings.model_for(provider, behavior=True)
+        )
         self.model.setEnabled(True)
         self._store_model(provider, selected)
 
@@ -888,10 +989,7 @@ class BehaviorTab(QWidget):
         self.settings_changed.emit()
 
     def _store_model(self, provider: str, value: str) -> None:
-        if provider == "Gemini":
-            self.settings.behavior_gemini_model = value
-        else:
-            self.settings.behavior_openai_model = value
+        self.settings.set_model(provider, value, behavior=True)
 
     def refresh_from_settings(self) -> None:
         selected = self.provider.refresh_availability(
@@ -920,12 +1018,12 @@ class BehaviorTab(QWidget):
     def _refresh_key_status(self) -> None:
         provider = self.provider.value()
         configured = bool(provider and self.secrets.get_api_key(provider))
-        self.key_status.setText(f"{provider} 등록됨" if configured else "API 키 없음")
+        self.key_status.setText(self.secrets.key_status_text(provider) if configured else "API 키 없음")
         self.key_status.setProperty("badge", "success" if configured else "warning")
         self.key_status.style().unpolish(self.key_status)
         self.key_status.style().polish(self.key_status)
         if not configured:
-            set_faded_text(self.status, "OpenAI 또는 Gemini API 키를 먼저 등록하세요.")
+            set_faded_text(self.status, no_key_message())
         elif "API 키" in self.status.text():
             self.status.setText("학생별 특성을 선택하세요.")
 
@@ -999,7 +1097,7 @@ class BehaviorTab(QWidget):
         provider = self.provider.value()
         model = self.model.model_id()
         if not provider:
-            QMessageBox.information(self, "API 키 필요", "OpenAI 또는 Gemini API 키를 먼저 등록하세요.")
+            QMessageBox.information(self, "API 키 필요", no_key_message())
             return
         api_key = self.secrets.get_api_key(provider)
         if not api_key:
@@ -1038,18 +1136,61 @@ class BehaviorTab(QWidget):
         self.worker = BehaviorGenerationWorker(request, api_key, parent=self)
         self.worker.succeeded.connect(self._on_generated)
         self.worker.failed.connect(self._on_generation_failed)
+        self.worker.batch_finished.connect(self._on_batch_finished)
         self.worker.progress_changed.connect(self._on_progress)
-        self.worker.status_changed.connect(
-            lambda message: set_faded_text(self.status, message)
-        )
+        self.worker.status_changed.connect(self._set_status_note)
         self.worker.finished.connect(self._worker_finished)
         self._set_generating(True)
         self.progress.setValue(0)
-        set_faded_text(self.status, f"{len(states)}명 생성 중...")
+        self._done, self._total, self._status_note = 0, len(states), ""
+        # 묶음 10명 × 동시 3묶음 = 한 번에 30명씩 보냅니다.
+        self._waves = math.ceil(len(states) / (10 * PARALLEL_BATCHES))
+        self._timing_key = (provider, model)
+        per_wave = self._seconds_per_wave.get(
+            self._timing_key, SECONDS_PER_WAVE.get(provider, DEFAULT_SECONDS_PER_WAVE)
+        )
+        self._expected_seconds = per_wave * self._waves
+        self._started_at = time.monotonic()
+        self._update_elapsed()
+        self._elapsed_timer.start()
         self.worker.start()
 
-    def _on_generated(self, generated: BehaviorGenerationResult) -> None:
-        for result in generated.results:
+    def _set_status_note(self, message: str) -> None:
+        self._status_note = message
+        self._update_elapsed()
+
+    def _update_elapsed(self) -> None:
+        elapsed = time.monotonic() - self._started_at
+        real = int(self._done / max(self._total, 1) * 100)
+        self.progress.setValue(max(real, estimated_progress(elapsed, self._expected_seconds)))
+        text = f"{self._done}/{self._total}명 완료 · {int(elapsed)}초 경과"
+        remaining = int(self._expected_seconds - elapsed)
+        if self._status_note:
+            text += f" · {self._status_note}"
+        elif remaining > 0:
+            text += f" · 약 {remaining}초 남음" if remaining < 60 else f" · 약 {remaining // 60}분 남음"
+        elif elapsed > self._expected_seconds:
+            text += " · 예상보다 오래 걸리고 있습니다. 멈추려면 '중지'를 누르세요."
+        self.status.setText(text)
+
+    def _stop_generation(self) -> None:
+        if not self.worker:
+            return
+        self.worker.request_stop()
+        self.stop_button.setEnabled(False)
+        self._set_status_note("이미 보낸 묶음이 끝나면 멈춥니다...")
+
+    def _reset_unfinished_states(self) -> int:
+        """중지되어 결과를 받지 못한 학생을 생성 전 상태로 되돌리고 그 수를 돌려줍니다."""
+        count = 0
+        for state in self.states.values():
+            if state.status == "generating":
+                state.status = "ok" if state.draft else "not_generated"
+                count += 1
+        return count
+
+    def _store_generated(self, results) -> None:
+        for result in results:
             state = self.states.get(result.student_id)
             if not state:
                 continue
@@ -1059,6 +1200,24 @@ class BehaviorTab(QWidget):
                 state.draft = result.comment
                 state.used_trait_ids = list(result.used_trait_ids)
                 state.omitted_trait_ids = list(result.omitted_trait_ids)
+
+    def _on_batch_finished(self, results) -> None:
+        self._store_generated(results)
+        self._refresh_students()
+        if any(result.student_id == self.current_student_id for result in results):
+            self._load_current()
+
+    def _on_generated(self, generated: BehaviorGenerationResult) -> None:
+        self._elapsed_timer.stop()
+        elapsed = time.monotonic() - self._started_at
+        self._store_generated(generated.results)
+        stopped = self._reset_unfinished_states()
+        if not stopped:
+            # 중지하지 않고 끝까지 받은 경우만, 지난번 값과 평균 내어 다음 어림에 씁니다 (한 번 튄 값에 덜 흔들림).
+            measured = elapsed / self._waves
+            previous = self._seconds_per_wave.get(self._timing_key)
+            self._seconds_per_wave[self._timing_key] = measured if previous is None else (previous + measured) / 2
+            self.progress.setValue(100)
         self._refresh_students()
         self._load_current()
         self._schedule_save()
@@ -1067,9 +1226,12 @@ class BehaviorTab(QWidget):
         suffix = ""
         if failed_count:
             suffix += f" · 생성 실패 {failed_count}명"
+        if stopped:
+            suffix += f" · 중지되어 {stopped}명은 생성하지 않음"
         set_faded_text(self.status, f"생성 완료 {ok_count}명{suffix}")
 
     def _on_generation_failed(self, message: str) -> None:
+        self._elapsed_timer.stop()
         for state in self.states.values():
             if state.status == "generating":
                 state.status = "failed"
@@ -1080,13 +1242,16 @@ class BehaviorTab(QWidget):
         set_faded_text(self.status, "생성 실패")
 
     def _worker_finished(self) -> None:
+        self._elapsed_timer.stop()
         self.worker = None
         self._set_generating(False)
         self._set_generation_availability()
 
     def _on_progress(self, done: int, total: int) -> None:
-        self.progress.setValue(int(done / max(total, 1) * 100))
-        set_faded_text(self.status, f"{done}/{total}명 생성 완료")
+        self._done, self._total = done, total
+        if self.stop_button.isEnabled():
+            self._status_note = ""  # 재시도 안내는 묶음이 끝나면 지웁니다. 중지 안내는 남깁니다.
+        self._update_elapsed()
 
     def _set_generating(self, generating: bool) -> None:
         for widget in (
@@ -1097,8 +1262,42 @@ class BehaviorTab(QWidget):
             self.default_sentence_count,
         ):
             widget.setEnabled(not generating)
+        self.stop_button.setVisible(generating)
+        self.stop_button.setEnabled(True)
+
+    def _on_input_tab_count_changed(self, count: int) -> None:
+        self.settings.behavior_tab_count = count
+        self.settings_changed.emit()
+
+    def _sync_draft_from_editor(self) -> None:
+        """결과 칸에 보이는 글이 초안과 다를 때만 초안에 반영합니다. (같으면 생성 중·실패 상태를 건드리지 않음)"""
+        state = self._current_state()
+        if state and self.draft.toPlainText().strip() != state.draft:
+            self._on_draft_changed()
+
+    def _request_auto_input(self) -> None:
+        self._sync_draft_from_editor()
+        rows = self.roster.rows()
+        drafts = {
+            row.student_id: self.states[row.student_id].draft
+            for row in rows
+            if self.states[row.student_id].draft
+        }
+        if not drafts:
+            QMessageBox.information(self, "입력할 결과 없음", "생성된 행동발달 결과가 없습니다.")
+            return
+        # 초안이 없는 학생은 빈 행으로 보냅니다. 표에 남아 있던 다른 내용(예: 교과 평어)이 행발 칸에 들어가지 않게 합니다.
+        input_rows = [StudentRow(row.name, drafts.get(row.student_id, ""), row.student_id) for row in rows]
+        self.auto_input_requested.emit(drafts, input_rows, self.input_controls.value())
+
+    def set_macro_status(self, state: str, text: str) -> None:
+        """자동 입력 상태를 버튼과 상태 줄에 보여 줍니다. 화면은 그대로 둡니다."""
+        self.input_controls.set_state(state)
+        if text:
+            set_faded_text(self.status, text)
 
     def _apply_results(self) -> None:
+        self._sync_draft_from_editor()
         chosen = [
             state
             for state in self.states.values()
@@ -1126,7 +1325,7 @@ class BehaviorTab(QWidget):
                 return
         mapping = {state.student_id: state.draft for state in chosen}
         self.comments_ready.emit(mapping)
-        set_faded_text(self.status, f"{len(mapping)}명의 결과를 NEIS 표에 적용했습니다.")
+        set_faded_text(self.status, f"{len(mapping)}명의 결과를 NEIS 표에 넣었습니다.")
 
     def _schedule_save(self) -> None:
         self._save_timer.start()

@@ -1,9 +1,17 @@
 # 개인 작업 파일 (실제 학생 정보·개인 설정 — 절대 커밋하지 마세요)
 /config.json
+/fetched_models.json
 /data.csv
 /student.csv
 hb_work.json
 hb_custom_traits.json
+# 외부 참고 자료·실제 학급 평어 예시 (저작권·개인정보)
+/reference/
+# API 키 (절대 커밋하지 마세요)
+.env
+neis_v4/_bundled_key.py
+# 저장 도중 꺼지면 남을 수 있는 임시 파일 (학생 정보 포함 가능)
+*.tmp
 
 # Python
 .venv/

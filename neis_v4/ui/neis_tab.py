@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from datetime import datetime
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -63,6 +63,35 @@ def parse_tabular_clipboard(text: str) -> list[list[str]]:
     return rows
 
 
+def empty_rows_before_last_content(rows: list[StudentRow]) -> list[int]:
+    """Return 1-based numbers of empty rows that would shift later students."""
+    filled = [index for index, row in enumerate(rows) if row.content.strip()]
+    if not filled:
+        return []
+    return [index + 1 for index in range(filled[-1]) if not rows[index].content.strip()]
+
+
+def fill_empty_rows(contents: list[str], comments: list[str]) -> list[str]:
+    """Put comments into empty rows in order; leftover comments become new rows."""
+    result = list(contents)
+    remaining = list(comments)
+    for index, content in enumerate(result):
+        if not remaining:
+            break
+        if not content.strip():
+            result[index] = remaining.pop(0)
+    return result + remaining
+
+
+def content_bytes(text: str) -> int:
+    """NEIS처럼 한글 1자 = 3byte, 영문·숫자·공백 = 1byte로 셉니다."""
+    return len(text.strip().encode("utf-8"))
+
+
+# 표의 0·1열(이름·내용)만 실제 데이터이고, 2열(분량)은 화면 표시용입니다.
+DATA_COLUMNS = 2
+LENGTH_COLUMN = 2
+
 CellState = tuple[str, object] | None
 TableState = tuple[int, dict[tuple[int, int], CellState]]
 
@@ -112,7 +141,7 @@ class SpreadsheetTableWidget(QTableWidget):
     def _state(self) -> TableState:
         cells: dict[tuple[int, int], CellState] = {}
         for row in range(self.rowCount()):
-            for column in range(self.columnCount()):
+            for column in range(min(self.columnCount(), DATA_COLUMNS)):
                 state = self._item_state(self.item(row, column))
                 if state is not None:
                     cells[(row, column)] = state
@@ -207,6 +236,9 @@ class NeisTab(QWidget):
     settings_changed = Signal()
     rows_changed = Signal()
     start_hotkey_pressed = Signal()
+    # 자동 입력 상태("idle" 대기 없음 · "armed" 시작 키 대기 · "running" 입력 중)와 안내 글.
+    # AI 평어·행동발달 화면도 이 신호로 버튼과 상태 줄을 바꿉니다.
+    macro_status_changed = Signal(str, str)
 
     def __init__(
         self,
@@ -225,13 +257,29 @@ class NeisTab(QWidget):
         self._hotkey_handle = None
         self._keyboard_module = None
         self._resizing_rows = False
+        # 선택한 행부터 이어서 입력할 때의 시작 행(0부터)
+        self._start_index = 0
+        # 시작 키를 기다리는 동안 입력할 행과 이동 칸. 행이 None이면 키를 누를 때 표를 다시 읽습니다.
+        self._armed_rows: list[StudentRow] | None = None
+        self._armed_tab_count = self.settings.tab_count
+        # 표를 고치면 잠시 뒤 data.csv에 자동 저장합니다 (프로그램이 갑자기 꺼져도 작업이 남도록).
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(1500)
+        self._autosave_timer.timeout.connect(self._autosave)
         rows = roster.rows()
 
-        self.table = SpreadsheetTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["이름", "내용"])
+        self.table = SpreadsheetTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["이름", "내용", "분량"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(LENGTH_COLUMN, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 140)
+        self.table.setColumnWidth(LENGTH_COLUMN, 130)
+        self.table.horizontalHeaderItem(LENGTH_COLUMN).setToolTip(
+            "글자 수와 바이트(한글 1자 = 3byte)입니다.\n"
+            "최대 분량을 넘으면 빨간색으로 표시됩니다. 최대 분량은 환경 설정에서 바꿀 수 있습니다."
+        )
         self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.verticalHeader().setMinimumWidth(34)
         self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
@@ -262,7 +310,7 @@ class NeisTab(QWidget):
         self.leading_space_help = HelpButton(
             "앞에 빈칸",
             "입력할 내용 맨 앞에 공백 한 칸을 먼저 넣습니다.\n"
-            "NEIS에서 첫 글자가 누락되거나 앞 내용과 붙어 보이는 경우 사용하세요.",
+            "NEIS에서 첫 글자가 빠지거나 앞 내용과 붙어 보일 때 사용하세요.",
         )
         self.failsafe_toggle = ToggleSwitch(self.settings.pyautogui_failsafe)
         self.failsafe_toggle.setToolTip("자동 입력 중 마우스를 화면 모서리로 옮기면 즉시 중지합니다.")
@@ -273,7 +321,7 @@ class NeisTab(QWidget):
         )
         self.hotkey_start_toggle = ToggleSwitch(self.settings.hotkey_start_enabled)
         self.hotkey_start_toggle.setToolTip(
-            "활성화하면 시작 버튼을 누른 뒤 선택한 기능 키로 즉시 입력을 시작합니다."
+            "켜 두면 시작 버튼을 누른 뒤 선택한 기능 키로 즉시 입력을 시작합니다."
         )
         self.start_hotkey = ArrowComboBox()
         self.start_hotkey.addItems([f"F{number}" for number in range(2, 11)])
@@ -290,7 +338,7 @@ class NeisTab(QWidget):
         self.hotkey_note.setObjectName("MutedLabel")
         self.student_count_stepper = NumberStepper(1, self.MAX_STUDENT_COUNT, 1)
         self.student_count_stepper.setValue(len(rows))
-        self.student_count_stepper.setToolTip("학생 수에 맞춰 표의 행을 추가하거나 줄입니다.")
+        self.student_count_stepper.setToolTip("학생 수에 맞춰 표의 행을 늘리거나 줄입니다.")
         self.settings.student_count = len(rows)
 
         self.save_button = QPushButton("작업 저장")
@@ -326,7 +374,7 @@ class NeisTab(QWidget):
         header = QVBoxLayout()
         title = QLabel("NEIS 자동 입력")
         title.setObjectName("PageTitle")
-        subtitle = QLabel("학생별 행동발달 내용을 정리하고 현재 NEIS 입력칸부터 순서대로 자동 입력합니다.")
+        subtitle = QLabel("학생별 교과 평어·행동발달 내용을 정리하고 현재 NEIS 입력칸부터 순서대로 자동 입력합니다.")
         subtitle.setObjectName("PageSubtitle")
         subtitle.setWordWrap(True)
         header.addWidget(title)
@@ -453,14 +501,61 @@ class NeisTab(QWidget):
         self.hotkey_start_toggle.toggled.connect(self._on_hotkey_mode_toggled)
         self.start_hotkey.currentTextChanged.connect(self._on_start_hotkey_changed)
         self.start_hotkey_pressed.connect(self._start_from_hotkey)
+        self.rows_changed.connect(self.refresh_lengths)
+        self.rows_changed.connect(self._autosave_timer.start)
+
+    def refresh_lengths(self) -> None:
+        """'분량' 칸을 다시 계산합니다. 최대 분량은 환경 설정에서 바꿉니다."""
+        limit = self.settings.content_byte_limit
+        self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                content_item = self.table.item(row, 1)
+                text = content_item.text().strip() if content_item else ""
+                size = content_bytes(text)
+                item = self.table.item(row, LENGTH_COLUMN)
+                if item is None:
+                    item = QTableWidgetItem()
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    self.table.setItem(row, LENGTH_COLUMN, item)
+                over = size > limit
+                item.setText(f"{len(text)}자 · {size}byte" if text else "")
+                item.setData(Qt.ForegroundRole, QColor(COLORS["danger"]) if over else None)
+                item.setToolTip(f"최대 {limit}byte보다 {size - limit}byte 많습니다." if over else "")
+        finally:
+            self.table.blockSignals(False)
+
+    def over_limit_rows(self, rows: list[StudentRow], offset: int = 0) -> list[int]:
+        limit = self.settings.content_byte_limit
+        return [
+            offset + index + 1
+            for index, row in enumerate(rows)
+            if content_bytes(row.content) > limit
+        ]
 
     def _toggle_macro(self) -> None:
+        if self.input_state() == "idle":
+            self.start_macro()
+        else:
+            self.stop_or_cancel()
+
+    def input_state(self) -> str:
+        if self.runner:
+            return "running"
+        return "armed" if self._hotkey_armed else "idle"
+
+    def stop_or_cancel(self) -> None:
+        """입력 중이면 멈추고, 시작 키를 기다리는 중이면 대기를 취소합니다."""
         if self.runner:
             self.stop_macro()
         elif self._hotkey_armed:
             self._cancel_hotkey_wait()
-        else:
-            self.start_macro()
+
+    def _announce(self, text: str) -> None:
+        """상태 줄에 안내를 띄우고, 다른 화면에도 같은 안내를 보냅니다."""
+        set_faded_text(self.status_label, text)
+        self.macro_status_changed.emit(self.input_state(), text)
 
     def _change_student_count(self, value: float) -> None:
         if self._resizing_rows:
@@ -488,7 +583,7 @@ class NeisTab(QWidget):
                 answer = QMessageBox.question(
                     self,
                     "학생 수 줄이기",
-                    f"마지막 {current_count - new_count}개의 행이 삭제됩니다.\n"
+                    f"마지막 {current_count - new_count}개 행이 삭제됩니다.\n"
                     f"삭제 대상에 {' · '.join(details)}이 있습니다.\n\n계속할까요?",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No,
@@ -591,15 +686,14 @@ class NeisTab(QWidget):
     def _start_from_hotkey(self) -> None:
         if self._hotkey_armed and not self.runner:
             self._hotkey_armed = False
-            self._start_runner(self.rows(), start_delay=0)
+            # 표에서 시작했다면 기다리는 동안 고친 내용까지 반영되도록 지금 표를 읽습니다.
+            rows = self.rows()[self._start_index :] if self._armed_rows is None else self._armed_rows
+            self._start_runner(rows, start_delay=0, tab_count=self._armed_tab_count)
 
     def _arm_hotkey_start(self) -> None:
         self._hotkey_armed = True
         hotkey = self.settings.start_hotkey
-        set_faded_text(
-            self.status_label,
-            f"NEIS 첫 입력칸을 선택하고 {hotkey} 키를 누르세요.",
-        )
+        self._announce(f"NEIS 첫 입력칸을 선택하고 {hotkey} 키를 누르세요.")
         self.run_button.setText("시작 대기 취소")
         self.run_button.setProperty("variant", "secondary")
         self.run_button.setIcon(icon("clock-3", COLORS["muted"]))
@@ -610,8 +704,8 @@ class NeisTab(QWidget):
         if not self._hotkey_armed:
             return
         self._hotkey_armed = False
-        set_faded_text(self.status_label, "시작 대기를 취소했습니다.")
         self._set_running(False)
+        self._announce("시작 대기를 취소했습니다.")
 
     def rows(self) -> list[StudentRow]:
         rows: list[StudentRow] = []
@@ -638,6 +732,7 @@ class NeisTab(QWidget):
             self.table.setItem(index, 0, name_item)
             self.table.setItem(index, 1, QTableWidgetItem(row.content))
         self.table.blockSignals(False)
+        self.refresh_lengths()
         if undo_state is None:
             self.table.reset_undo_history()
         else:
@@ -648,6 +743,37 @@ class NeisTab(QWidget):
         if hasattr(self, "student_count_stepper"):
             self._set_student_count_value(len(rows))
             self.settings.student_count = len(rows)
+
+    def receive_ai_comments(self, comments: list[str]) -> int:
+        """AI 평어를 표에 넣고 넣은 개수를 돌려줍니다. 취소하면 0입니다."""
+        if not comments:
+            return 0
+        self._commit_table_edits()
+        contents = [row.content for row in self.rows()]
+        filled = sum(bool(content.strip()) for content in contents[: len(comments)])
+        if filled:
+            box = QMessageBox(
+                QMessageBox.Question,
+                "기존 내용이 있습니다",
+                f"1~{len(comments)}번 행 중 {filled}명에게 이미 내용이 있습니다.\n\n"
+                "· 덮어쓰기(Enter): 1번 행부터 차례로 바꿉니다.\n"
+                "· 빈 행에만 넣기: 내용이 없는 행에만 차례로 넣고, 남으면 아래에 행을 추가합니다.\n\n"
+                "넣은 뒤에도 자동 입력 화면에서 Ctrl+Z로 되돌릴 수 있습니다.",
+                parent=self,
+            )
+            # 대부분 덮어쓰므로 덮어쓰기를 맨 앞의 기본 버튼(Enter)으로 둡니다.
+            overwrite = box.addButton("덮어쓰기", QMessageBox.AcceptRole)
+            empty_only = box.addButton("빈 행에만 넣기", QMessageBox.ActionRole)
+            box.addButton("취소", QMessageBox.RejectRole)
+            box.setDefaultButton(overwrite)
+            box.exec()
+            if box.clickedButton() is empty_only:
+                self.put_comments(fill_empty_rows(contents, comments))
+                return len(comments)
+            if box.clickedButton() is not overwrite:
+                return 0
+        self.put_comments(comments)
+        return len(comments)
 
     def put_comments(self, comments: list[str]) -> None:
         undo_state = self.table.begin_grouped_change()
@@ -703,6 +829,16 @@ class NeisTab(QWidget):
         set_faded_text(self.status_label, f"작업 저장 완료 · {time_text}")
         self.status_label.setToolTip(f"저장 위치: {path}")
 
+    def _autosave(self) -> None:
+        try:
+            self.storage.save_students(self.rows())
+        except Exception:
+            # 엑셀 등에서 data.csv를 열어 두면 저장이 막힙니다. 창을 닫을 때 다시 저장하고, 실패하면 그때 알립니다.
+            set_faded_text(
+                self.status_label,
+                "자동 저장 실패 · 다른 프로그램에서 data.csv를 열어 두었다면 닫아 주세요",
+            )
+
     def load_data(self) -> None:
         rows = self.storage.load_saved_students()
         if not rows:
@@ -757,7 +893,7 @@ class NeisTab(QWidget):
 
     def _paste_tabular_text(self, text: str, start_row: int, start_column: int) -> None:
         clipboard_rows = parse_tabular_clipboard(text)
-        if not clipboard_rows or start_column >= self.table.columnCount():
+        if not clipboard_rows or start_column >= DATA_COLUMNS:
             return
 
         max_rows = self.MAX_STUDENT_COUNT
@@ -788,7 +924,7 @@ class NeisTab(QWidget):
                 target_row = start_row + row_offset
                 for column_offset, value in enumerate(values):
                     target_column = start_column + column_offset
-                    if target_column >= self.table.columnCount():
+                    if target_column >= DATA_COLUMNS:
                         break
                     item = self.table.item(target_row, target_column)
                     if item is None:
@@ -824,71 +960,195 @@ class NeisTab(QWidget):
         self.set_rows(rows, record_undo=True)
         self.status_label.setText("내용을 초기화했습니다.")
 
-    def start_macro(self) -> None:
+    def _ask_start_index(self, rows: list[StudentRow]) -> int | None:
+        """선택한 행이 있으면 그 행부터 입력할지 묻습니다. 취소하면 None입니다."""
+        selected = {index.row() for index in self.table.selectedIndexes()}
+        start = min(selected) if selected else 0
+        if start <= 0 or start >= len(rows):
+            return 0
+        box = QMessageBox(
+            QMessageBox.Question,
+            "시작 위치 선택",
+            f"표에서 {start + 1}번 행({rows[start].name})이 선택되어 있습니다.\n"
+            f"{start + 1}번부터 이어서 입력할까요?\n\n"
+            "이어서 입력하면 NEIS에서도 같은 학생의 입력칸을 클릭해야 합니다.",
+            parent=self,
+        )
+        from_selected = box.addButton(f"{start + 1}번부터", QMessageBox.AcceptRole)
+        from_first = box.addButton("1번부터", QMessageBox.AcceptRole)
+        box.addButton("취소", QMessageBox.RejectRole)
+        box.setDefaultButton(from_selected)
+        box.exec()
+        if box.clickedButton() is from_selected:
+            return start
+        if box.clickedButton() is from_first:
+            return 0
+        return None
+
+    def start_macro(self, rows: list[StudentRow] | None = None, tab_count: int | None = None) -> None:
+        """표의 행(또는 받은 행)을 NEIS에 입력합니다.
+
+        AI 평어·행동발달 화면은 입력할 행과 그 화면의 이동 칸을 넘깁니다. 넘기지 않으면 표 전체와 이 화면의 설정을 씁니다.
+        """
+        if self.input_state() != "idle":
+            return  # 다른 화면에서 두 번 시작되지 않게 합니다.
         self._sync_settings()
-        rows = self.rows()
+        from_table = rows is None
+        rows = self.rows() if rows is None else rows
+        if tab_count not in (2, 3, 4):
+            tab_count = self.settings.tab_count
         if not any(row.content.strip() for row in rows):
             QMessageBox.information(self, "입력할 내용 없음", "표의 '내용' 칸을 먼저 작성하거나 불러오세요.")
             return
+        start = self._ask_start_index(rows)
+        if start is None:
+            return
+        first_row = rows[start]
+        rows = rows[start:]
+        if not any(row.content.strip() for row in rows):
+            QMessageBox.information(
+                self, "입력할 내용 없음", f"{start + 1}번 행부터는 입력할 내용이 없습니다."
+            )
+            return
+        gaps = [start + number for number in empty_rows_before_last_content(rows)]
+        if gaps:
+            shown = ", ".join(f"{number}번" for number in gaps[:10])
+            if len(gaps) > 10:
+                shown += f" 외 {len(gaps) - 10}개"
+            if QMessageBox.question(
+                self,
+                "중간에 빈 행이 있습니다",
+                f"{shown} 행의 내용이 비어 있습니다.\n"
+                "빈 행은 붙여넣기와 Tab 이동을 모두 건너뛰어 이후 학생이 한 칸씩 밀릴 수 있습니다.\n\n"
+                "그래도 시작할까요?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+        over = self.over_limit_rows(rows, offset=start)
+        if over:
+            shown = ", ".join(f"{number}번" for number in over[:10])
+            if len(over) > 10:
+                shown += f" 외 {len(over) - 10}개"
+            if QMessageBox.question(
+                self,
+                "최대 분량을 넘는 행이 있습니다",
+                f"{shown} 행이 최대 {self.settings.content_byte_limit}byte를 넘습니다.\n"
+                "NEIS에서 내용이 잘리거나 저장되지 않을 수 있습니다.\n\n"
+                "그래도 시작할까요?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+        self._start_index = start
+        target = (
+            "NEIS 첫 입력칸"
+            if start == 0
+            else f"NEIS에서 {start + 1}번 학생({first_row.name})의 입력칸"
+        )
+        moves = f"학생 {len(rows)}명 · 입력 후 Tab {tab_count}번 이동"
         if self.settings.hotkey_start_enabled:
             QMessageBox.information(
                 self,
                 "키를 눌러 시작",
-                f"NEIS 첫 입력칸을 선택하고 {self.settings.start_hotkey} 키를 누르세요.\n"
+                f"{moves}\n\n"
+                f"{target}을 선택하고 {self.settings.start_hotkey} 키를 누르세요.\n"
                 "선택한 키를 누르면 바로 자동 입력이 시작됩니다.",
             )
+            self._armed_rows = None if from_table else rows
+            self._armed_tab_count = tab_count
             self._arm_hotkey_start()
             return
         if QMessageBox.information(
             self,
             "NEIS 자동 입력 시작",
-            "확인을 누르면 5초 카운트다운이 시작됩니다.\n그동안 NEIS의 첫 입력칸을 클릭하세요.\n\n입력 중에는 Esc 키 또는 화면 모서리로 긴급 중지할 수 있습니다.",
+            f"{moves}\n\n"
+            f"확인을 누르면 5초 카운트다운이 시작됩니다.\n그동안 {target}을 클릭하세요.\n\n입력 중에는 Esc 키 또는 화면 모서리로 긴급 중지할 수 있습니다.",
             QMessageBox.Ok | QMessageBox.Cancel,
         ) != QMessageBox.Ok:
             return
-        self._start_runner(rows, start_delay=5)
+        self._start_runner(rows, start_delay=5, tab_count=tab_count)
 
-    def _start_runner(self, rows: list[StudentRow], start_delay: int) -> None:
+    def _start_runner(self, rows: list[StudentRow], start_delay: int, tab_count: int | None = None) -> None:
         self.runner = MacroRunner(
             rows=rows,
-            tab_count=self.settings.tab_count,
+            tab_count=tab_count or self.settings.tab_count,
             delay=self.settings.macro_delay,
             leading_space=self.settings.leading_space,
             failsafe=self.settings.pyautogui_failsafe,
             start_delay=start_delay,
         )
         self.runner.progress.connect(self._on_progress)
-        self.runner.row_changed.connect(self._highlight_row)
+        self.runner.row_changed.connect(lambda index: self._highlight_row(index + self._start_index))
         self.runner.failed.connect(lambda message: QMessageBox.critical(self, "오류", message))
         self.runner.finished_with_state.connect(self._on_finished)
+        self._clear_highlights()
         self._set_running(True)
         self.progress.setValue(0)
         self.progress_label.setText(f"0/{len(rows)} 완료")
         self.runner.start()
+        self.macro_status_changed.emit(self.input_state(), "")
 
     def stop_macro(self) -> None:
         if self.runner:
             self.runner.stop()
-        set_faded_text(self.status_label, "중지 요청됨")
+        self._announce("중지 요청됨")
 
     def _on_progress(self, done: int, total: int, text: str) -> None:
         self.progress.setValue(int(done / max(total, 1) * 100))
         self.progress_label.setText(f"{done}/{total} 완료")
-        set_faded_text(self.status_label, text)
+        self._announce(text)
+
+    def _clear_highlights(self) -> None:
+        # 색만 바꾸는 것이므로 표 변경 신호(itemChanged)를 막습니다.
+        self.table.blockSignals(True)
+        try:
+            for row in range(self.table.rowCount()):
+                for column in range(self.table.columnCount()):
+                    item = self.table.item(row, column)
+                    if item:
+                        item.setData(Qt.BackgroundRole, None)
+        finally:
+            self.table.blockSignals(False)
 
     def _highlight_row(self, row: int) -> None:
         self.table.clearSelection()
         self.table.selectRow(row)
-        for column in range(self.table.columnCount()):
-            item = self.table.item(row, column)
-            if item:
-                item.setBackground(QColor("#E7F1FF"))
+        self.table.blockSignals(True)
+        try:
+            for column in range(self.table.columnCount()):
+                item = self.table.item(row, column)
+                if item:
+                    item.setBackground(QColor("#E7F1FF"))
+        finally:
+            self.table.blockSignals(False)
         self.table.scrollToItem(self.table.item(row, 0), QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def _on_finished(self, completed: bool) -> None:
         self._set_running(False)
-        set_faded_text(self.status_label, "완료되었습니다." if completed else "중지되었습니다.")
+        next_row = self._start_index
+        if self.runner:
+            done = self.runner.entered + len(self.runner.skipped)
+            next_row += done
+            # Esc는 넣던 학생을 끝까지 넣은 뒤에 멈춥니다. 마지막 학생을 넣다가 멈췄다면 다 끝난 것입니다.
+            completed = completed or done >= len(self.runner.rows)
+        text = "완료되었습니다." if completed else "중지되었습니다."
+        if self.runner:
+            text += f" · {self.runner.entered}명 입력"
+            skipped = [self._start_index + index + 1 for index in self.runner.skipped]
+            if skipped:
+                shown = ", ".join(str(number) for number in skipped[:10])
+                if len(skipped) > 10:
+                    shown += f" 외 {len(skipped) - 10}개"
+                text += f" · 빈 행 {len(skipped)}개 건너뜀({shown}번)"
+        self.table.clearSelection()
+        if not completed:
+            # 멈출 때 넣던 학생은 이미 다 들어갔으므로 그다음 학생을 골라 둡니다. (이어서 입력할 때 두 번 들어가지 않게)
+            self.table.selectRow(next_row)
+            text += " · 다시 시작하면 선택된 행부터 이어서 입력할 수 있습니다."
+        self.status_label.setToolTip(text)
         self.runner = None
+        self._announce(text)
 
     def _set_running(self, running: bool) -> None:
         self.hotkey_start_toggle.setEnabled(not running)

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from .base import AIProvider, AIProviderError, build_prompt, parse_comments
+from .base import (
+    REQUEST_TIMEOUT_SECONDS,
+    SDK_MAX_RETRIES,
+    AIProvider,
+    AIProviderError,
+    describe_error,
+    build_prompt,
+    parse_comments,
+)
 from .behavior_prompt import (
     BEHAVIOR_RESPONSE_SCHEMA,
     SYSTEM_PROMPT,
@@ -20,17 +28,24 @@ from neis_v4.models import (
 
 class OpenAIProvider(AIProvider):
     name = "OpenAI"
+    # OpenAI 호환 서비스(예: Upstage Solar)는 이 주소만 바꿔 씁니다. None = OpenAI 기본 주소
+    base_url: str | None = None
 
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
 
     def generate_comments(self, request: GenerationRequest) -> GenerationResult:
         if not self.api_key:
-            raise AIProviderError("OpenAI API 키가 설정되어 있지 않습니다.")
+            raise AIProviderError(f"{self.name} API 키가 설정되어 있지 않습니다.")
         try:
             from openai import OpenAI
 
-            client = OpenAI(api_key=self.api_key)
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                max_retries=SDK_MAX_RETRIES,
+            )
             prompt = build_prompt(request)
             response = client.responses.create(
                 model=request.model,
@@ -49,20 +64,29 @@ class OpenAIProvider(AIProvider):
                 return GenerationResult(parse_comments(repair_text), repair_text, repaired=True)
             return GenerationResult(comments, text)
         except Exception as exc:
-            raise AIProviderError(f"OpenAI 생성 실패: {exc}") from exc
+            raise AIProviderError(f"{self.name} 생성 실패: {self._error_detail(exc)}") from exc
 
     def generate_behavior(self, request: BehaviorGenerationRequest) -> BehaviorGenerationResult:
         if not self.api_key:
-            raise AIProviderError("OpenAI API 키가 설정되어 있지 않습니다.")
+            raise AIProviderError(f"{self.name} API 키가 설정되어 있지 않습니다.")
         try:
             from openai import OpenAI
 
-            client = OpenAI(api_key=self.api_key)
+            client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+                max_retries=SDK_MAX_RETRIES,
+            )
             text = self._request_behavior(client, request.model, build_behavior_prompt(request), 0.35)
             results = map_behavior_results(request, parse_behavior_response(text))
             return BehaviorGenerationResult(results, text)
         except Exception as exc:
-            raise AIProviderError(f"OpenAI 행동발달 생성 실패: {exc}") from exc
+            raise AIProviderError(f"{self.name} 행동발달 생성 실패: {self._error_detail(exc)}") from exc
+
+    @staticmethod
+    def _error_detail(exc: Exception) -> str:
+        return describe_error(exc)
 
     @staticmethod
     def _request_behavior(client, model: str, prompt: str, temperature: float) -> str:

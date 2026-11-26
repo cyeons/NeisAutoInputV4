@@ -12,12 +12,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from neis_v4.ai.model_catalog import PROVIDERS, provider_ids
 from neis_v4.models import AppSettings
 from neis_v4.secrets import SecretStore
 from neis_v4.ui.api_keys import ApiKeyManagerDialog
 from neis_v4.ui.provider_controls import ModelSelector, ProviderSelector
 from neis_v4.ui.theme import icon
-from neis_v4.ui.widgets import ToggleSwitch
+from neis_v4.ui.widgets import NumberStepper, ToggleSwitch
 
 
 class ProviderModelEditor(QFrame):
@@ -27,7 +28,7 @@ class ProviderModelEditor(QFrame):
         super().__init__(parent)
         self.setProperty("role", "SubPanel")
         self.secrets = secrets
-        self.models = {"Gemini": "gemini-3.5-flash", "OpenAI": "gpt-5.4-mini"}
+        self.models = {item.provider_id: item.default_model_id for item in PROVIDERS}
         self.provider = ProviderSelector()
         self.model = ModelSelector()
         layout = QVBoxLayout(self)
@@ -80,6 +81,8 @@ class SettingsTab(QWidget):
 
         self.always_on_top = ToggleSwitch(settings.always_on_top)
         self.use_windows_trust_store = ToggleSwitch(settings.use_windows_trust_store)
+        self.byte_limit = NumberStepper(100, 6000, 100, suffix="byte")
+        self.byte_limit.setValue(settings.content_byte_limit)
         self.ai_defaults = ProviderModelEditor("AI 평어 기본값", secrets)
         self.behavior_defaults = ProviderModelEditor("행동발달 기본값", secrets)
 
@@ -149,6 +152,14 @@ class SettingsTab(QWidget):
         cert_row.addWidget(self.use_windows_trust_store)
         cert_row.addWidget(cert_help, 1)
         general_layout.addLayout(cert_row)
+        limit_row = QHBoxLayout()
+        limit_help = QLabel("한글 1자 = 3byte (1500byte ≈ 한글 500자) · 넘는 행은 자동 입력 표에 빨간색으로 표시")
+        limit_help.setObjectName("MutedLabel")
+        limit_help.setWordWrap(True)
+        limit_row.addWidget(QLabel("NEIS 입력칸 최대 분량"))
+        limit_row.addWidget(self.byte_limit)
+        limit_row.addWidget(limit_help, 1)
+        general_layout.addLayout(limit_row)
         layout.addWidget(general_title)
         layout.addWidget(general)
 
@@ -187,6 +198,7 @@ class SettingsTab(QWidget):
     def _connect_dirty_state(self) -> None:
         self.always_on_top.toggled.connect(self._mark_dirty)
         self.use_windows_trust_store.toggled.connect(self._mark_dirty)
+        self.byte_limit.valueChanged.connect(self._mark_dirty)
         self.ai_defaults.changed.connect(self._mark_dirty)
         self.behavior_defaults.changed.connect(self._mark_dirty)
 
@@ -197,18 +209,16 @@ class SettingsTab(QWidget):
             self.use_windows_trust_store.setChecked(
                 self.settings.use_windows_trust_store
             )
+            self.byte_limit.setValue(self.settings.content_byte_limit)
             self.ai_defaults.refresh(
                 self.settings.ai_provider,
-                {
-                    "Gemini": self.settings.gemini_model,
-                    "OpenAI": self.settings.openai_model,
-                },
+                {provider: self.settings.model_for(provider) for provider in provider_ids()},
             )
             self.behavior_defaults.refresh(
                 self.settings.behavior_provider,
                 {
-                    "Gemini": self.settings.behavior_gemini_model,
-                    "OpenAI": self.settings.behavior_openai_model,
+                    provider: self.settings.model_for(provider, behavior=True)
+                    for provider in provider_ids()
                 },
             )
             self._refresh_key_status()
@@ -223,7 +233,7 @@ class SettingsTab(QWidget):
     def _refresh_key_status(self) -> None:
         registered = self.secrets.registered_providers()
         if registered:
-            text = " · ".join(f"{provider} 등록됨" for provider in registered)
+            text = " · ".join(self.secrets.key_status_text(provider) for provider in registered)
             badge = "success"
         else:
             text = "등록된 API 키가 없습니다."
@@ -252,14 +262,17 @@ class SettingsTab(QWidget):
     def apply_to_settings(self) -> None:
         self.settings.always_on_top = self.always_on_top.isChecked()
         self.settings.use_windows_trust_store = self.use_windows_trust_store.isChecked()
+        self.settings.content_byte_limit = int(self.byte_limit.value())
         if self.ai_defaults.value():
             self.settings.ai_provider = self.ai_defaults.value()
-        self.settings.gemini_model = self.ai_defaults.models["Gemini"]
-        self.settings.openai_model = self.ai_defaults.models["OpenAI"]
+        for provider in provider_ids():
+            self.settings.set_model(provider, self.ai_defaults.models[provider])
         if self.behavior_defaults.value():
             self.settings.behavior_provider = self.behavior_defaults.value()
-        self.settings.behavior_gemini_model = self.behavior_defaults.models["Gemini"]
-        self.settings.behavior_openai_model = self.behavior_defaults.models["OpenAI"]
+        for provider in provider_ids():
+            self.settings.set_model(
+                provider, self.behavior_defaults.models[provider], behavior=True
+            )
         self.settings_changed.emit()
         self.save_button.setEnabled(False)
         self.save_status.setText("저장됨")
