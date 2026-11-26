@@ -31,3 +31,11 @@ tmp_ui_plan/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 저장소에 올리지 않는 개발 기록·쓰지 않는 파일 (내 컴퓨터에만 둠)
+/docs/plan_0617.md
+/docs/plan_hb.md
+/docs/prompt.md
+/docs/prompt_hb.md
+# 프로그램은 TTF 글꼴만 씁니다
+/resources/fonts/*.otf

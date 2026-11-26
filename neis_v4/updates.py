@@ -6,8 +6,8 @@ import re
 import urllib.request
 
 # 공개 저장소의 'Latest' 배포판입니다. 배포할 때 태그를 v4.6.0처럼 붙여야 비교할 수 있습니다.
-LATEST_RELEASE_API = "https://api.github.com/repos/cyeons/NeisAutoInputV4/releases/latest"
-RELEASES_PAGE = "https://github.com/cyeons/NeisAutoInputV4/releases/latest"
+LATEST_RELEASE_API = "https://api.github.com/repos/cyeons/NeisAutoInput/releases/latest"
+RELEASES_PAGE = "https://github.com/cyeons/NeisAutoInput/releases/latest"
 
 
 def version_numbers(text: str) -> tuple[int, ...]:

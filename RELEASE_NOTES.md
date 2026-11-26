@@ -10,7 +10,7 @@
 
 ### 업데이트 방법
 
-1. [Releases](https://github.com/cyeons/NeisAutoInputV4/releases/latest)에서 `NEISAutoInput.exe`를 내려받아 실행합니다. 설치 과정은 없습니다.
+1. [Releases](https://github.com/cyeons/NeisAutoInput/releases/latest)에서 `NEISAutoInput.exe`를 내려받아 실행합니다. 설치 과정은 없습니다.
 2. 작업 내용·설정·API 키는 그대로 이어집니다. 저장 위치(`%APPDATA%\NeisAutoInputV4`)가 바뀌지 않았기 때문입니다. 예전 실행 파일(`NeisAutoInputV4.3.exe` 등)은 지워도 됩니다.
 3. 작업표시줄에 예전 파일을 고정해 두었다면 고정을 풀고 새 파일을 다시 고정하세요. 새 아이콘도 그때 보입니다.
 4. **새 버전 알림은 이번 버전부터 들어갑니다.** V4.3 이하에서는 알림이 오지 않으니 이번 한 번은 직접 내려받아 주세요.

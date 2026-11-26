@@ -250,8 +250,6 @@ tests/                        단위 테스트
 docs/
   manual/                     사용 설명서(HTML)와 생성 스크립트
   architecture.md             V3 → V4 구조 설계 기록
-  plan_0617.md, plan_hb.md    기능 사양 (전체, 행동발달)
-  prompt.md, prompt_hb.md     행동발달 프롬프트 설계 기록
 NeisAutoInputV4.spec          PyInstaller 빌드 설정 (만들어지는 파일: dist\NEISAutoInput.exe)
 RELEASE_NOTES.md              버전별로 바뀐 점
 ```
@@ -264,7 +262,7 @@ RELEASE_NOTES.md              버전별로 바뀐 점
 4. AI 생성과 NEIS 입력은 화면이 멈추지 않도록 별도 스레드에서 돌아갑니다.
 5. NEIS 입력은 각 행의 내용을 클립보드에 복사한 뒤 `Ctrl+V`와 `Tab`을 보내는 방식입니다. 입력이 끝나면 원래 클립보드에 있던 글을 되돌려 놓습니다.
 
-설계 배경은 [docs/architecture.md](docs/architecture.md)와 [docs/plan_hb.md](docs/plan_hb.md)에 있습니다. 문서와 코드가 다르면 코드와 테스트가 기준입니다.
+설계 배경은 [docs/architecture.md](docs/architecture.md)에 있습니다. 문서와 코드가 다르면 코드와 테스트가 기준입니다.
 
 ## 자주 생기는 문제
 
@@ -288,7 +286,7 @@ RELEASE_NOTES.md              버전별로 바뀐 점
 출처 표기 예시:
 
 ```text
-이 프로그램은 NeisAutoInputV4(https://github.com/cyeons/NeisAutoInputV4)를 바탕으로 수정했습니다.
+이 프로그램은 NEISAutoInput(https://github.com/cyeons/NeisAutoInput)을 바탕으로 수정했습니다.
 ```
 
 포함된 글꼴과 아이콘은 각자의 라이선스를 따릅니다. SUIT·Pretendard 글꼴은 SIL Open Font License 1.1, Lucide 아이콘은 ISC 라이선스입니다.

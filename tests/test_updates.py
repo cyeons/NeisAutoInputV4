@@ -17,7 +17,7 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertFalse(is_newer("", "4.5.0"))
 
     def test_latest_release_tag_and_page_are_read(self) -> None:
-        reply = {"tag_name": "v4.6.0", "html_url": "https://github.com/cyeons/NeisAutoInputV4/releases/tag/v4.6.0"}
+        reply = {"tag_name": "v4.6.0", "html_url": "https://github.com/cyeons/NeisAutoInput/releases/tag/v4.6.0"}
         with patch(
             "neis_v4.updates.urllib.request.urlopen",
             return_value=io.BytesIO(json.dumps(reply).encode("utf-8")),

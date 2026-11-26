@@ -297,7 +297,7 @@ class ProviderUiTests(unittest.TestCase):
         ), patch("neis_v4.storage.legacy_dir", lambda: None):
             window = MainWindow()
             try:
-                url = "https://github.com/cyeons/NeisAutoInputV4/releases/tag/v9.0.0"
+                url = "https://github.com/cyeons/NeisAutoInput/releases/tag/v9.0.0"
                 with patch.object(QMessageBox, "exec") as shown:
                     window._on_update_found("v9.0.0", url)
                     window._on_update_found("v9.0.0", url)
